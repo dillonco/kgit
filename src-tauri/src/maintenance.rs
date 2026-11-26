@@ -25,15 +25,22 @@ fn started() -> &'static Mutex<HashSet<PathBuf>> {
 }
 
 pub(crate) fn run(root: &Path) -> GitResult {
-    let with = |repack: &'static str| {
+    let tasks = |tasks: &[&str]| {
         let mut args = vec!["maintenance", "run", "--quiet"];
-        args.extend(TASKS);
-        args.push(repack);
+        args.extend(tasks);
         run_git(root, &args)
     };
-    let result = with(REPACK);
-    if !result.ok && result.stderr.contains("not a valid task") {
-        return with(OLDER_REPACK);
+    let result = tasks(&TASKS);
+    if result.ok {
+        // Repacking is an optimisation: a failure here (for example
+        // incremental-repack finding no packs yet) does not fail maintenance.
+        let mut repack = tasks(&[REPACK]);
+        if !repack.ok && repack.stderr.contains("not a valid task") {
+            repack = tasks(&[OLDER_REPACK]);
+        }
+        if !repack.ok {
+            eprintln!("kgit: repack in {} skipped: {}", root.display(), repack.stderr.trim());
+        }
     }
     result
 }
