@@ -140,6 +140,65 @@ export function buildGraphRows(nodes: CommitNode[], options: GraphOptions = {}):
   return rows;
 }
 
+// Graph geometry, in CSS pixels. These must match `.graph-area` in
+// styles.css (--lane-center, --lane-pitch) and ROW_HEIGHT in App.svelte.
+export const LANE_CENTER = 38;
+export const LANE_PITCH = 22;
+export const GRAPH_ROW_HEIGHT = 28;
+const ARC_RADIUS = 8;
+// Lines run 1px past the row on each side so neighbouring rows overlap
+// instead of leaving a hairline seam at fractional zoom levels.
+const OVERLAP = 1;
+
+export type GraphPath = { d: string; color: string };
+
+const laneX = (index: number) => LANE_CENTER + index * LANE_PITCH;
+
+/**
+ * The lines of one graph row as SVG paths, drawn under the commit dot:
+ * - a vertical segment per running lane (from the node down only, for a lane
+ *   that starts here; down to the node only, for one that ends here);
+ * - each merge edge: across from the node, then a quarter arc down into the
+ *   parent's lane and on to the next row;
+ * - each join: a lane coming down from above, curving into the node.
+ */
+export function graphPaths(row: GraphRow): GraphPath[] {
+  const mid = GRAPH_ROW_HEIGHT / 2;
+  const top = -OVERLAP;
+  const bottom = GRAPH_ROW_HEIGHT + OVERLAP;
+  const r = ARC_RADIUS;
+  const paths: GraphPath[] = [];
+
+  for (const lane of row.lanes) {
+    if (lane.capStart && lane.capEnd) continue;
+    const x = laneX(lane.index);
+    paths.push({ d: `M ${x} ${lane.capStart ? mid : top} V ${lane.capEnd ? mid : bottom}`, color: lane.color });
+  }
+  for (const edge of row.edges) {
+    const from = laneX(edge.from);
+    const to = laneX(edge.to);
+    if (from === to) {
+      paths.push({ d: `M ${to} ${mid} V ${bottom}`, color: edge.color });
+      continue;
+    }
+    // Rightward then down turns clockwise (sweep 1); leftward then down, counter-clockwise.
+    const right = to > from;
+    const turnAt = right ? to - r : to + r;
+    paths.push({ d: `M ${from} ${mid} H ${turnAt} A ${r} ${r} 0 0 ${right ? 1 : 0} ${to} ${mid + r} V ${bottom}`, color: edge.color });
+  }
+  for (const join of row.joins) {
+    const from = laneX(join.from);
+    const to = laneX(join.to);
+    // Down then leftward turns clockwise; down then rightward, counter-clockwise.
+    const left = to < from;
+    paths.push({
+      d: `M ${from} ${top} V ${mid - r} A ${r} ${r} 0 0 ${left ? 1 : 0} ${left ? from - r : from + r} ${mid} H ${to}`,
+      color: join.color,
+    });
+  }
+  return paths;
+}
+
 export function groupRefs(refs: string[], remotes: string[]): RefGroup[] {
   const groups = new Map<string, RefGroup>();
   const group = (name: string, tag = false) => {

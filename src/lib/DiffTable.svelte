@@ -1,5 +1,5 @@
 <script lang="ts">
-  type DiffRow = { kind: string; oldNo: string; newNo: string; text: string };
+  import type { DiffRow } from "./diffRows";
   type SplitRow =
     | { kind: "full"; row: DiffRow }
     | { kind: "pair"; left: DiffRow | null; right: DiffRow | null };
@@ -7,6 +7,10 @@
   export let rows: DiffRow[];
   export let split = false;
   export let selectedHunkRow: number | null = null;
+  /** Line selection for line-level staging (unified view only). */
+  export let selectable = false;
+  export let selectedLines: Set<number> = new Set();
+  export let onToggleLine: (line: number, extend: boolean) => void = () => {};
 
   $: splitRows = split ? buildSplitRows(rows) : [];
 
@@ -54,8 +58,9 @@
     {/each}
   </div>
 {:else}
-  <div class="diff-table">
+  <div class="diff-table" class:selectable>
     {#each rows as row, index}
+      {@const changeRow = row.kind === "add" || row.kind === "del"}
       <div
         class="diff-line"
         class:hunk-row={row.kind === "hunk"}
@@ -63,9 +68,22 @@
         class:add-row={row.kind === "add"}
         class:del-row={row.kind === "del"}
         class:meta-row={row.kind === "meta"}
+        class:line-picked={selectable && selectedLines.has(row.line)}
       >
-        <span class="line-no">{row.oldNo}</span>
-        <span class="line-no">{row.newNo}</span>
+        {#if selectable && changeRow}
+          <button
+            class="line-pick"
+            title="Select this line (shift-click selects a range)"
+            aria-pressed={selectedLines.has(row.line)}
+            on:click={(event) => onToggleLine(row.line, event.shiftKey)}
+          >
+            <span class="line-no">{row.oldNo}</span>
+            <span class="line-no">{row.newNo}</span>
+          </button>
+        {:else}
+          <span class="line-no">{row.oldNo}</span>
+          <span class="line-no">{row.newNo}</span>
+        {/if}
         <code>{row.text}</code>
       </div>
     {/each}

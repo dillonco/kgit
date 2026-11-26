@@ -8,6 +8,14 @@
   export let selectedPath: string | undefined = undefined;
   export let tree = false;
   export let hideWhenEmpty = false;
+  /** Right-click handler for a file row. */
+  export let menu: ((event: MouseEvent, file: FileStatus) => void) | null = null;
+
+  function onMenu(event: MouseEvent, file: FileStatus | undefined) {
+    if (!menu || !file) return;
+    event.preventDefault();
+    menu(event, file);
+  }
 
   type TreeRow = { key: string; depth: number; kind: "dir" | "file"; name: string; file?: FileStatus };
   type TreeDir = { dirs: Map<string, TreeDir>; files: FileStatus[] };
@@ -102,7 +110,7 @@
             <strong>{row.name}</strong>
           </button>
         {:else if row.file}
-          <div class="file-row tree-row" class:active={selectedPath === row.file.path} style={`--depth:${row.depth}`}>
+          <div class="file-row tree-row" class:active={selectedPath === row.file.path} style={`--depth:${row.depth}`} role="group" on:contextmenu={(event) => onMenu(event, row.file)}>
             <button class="file-name tree-file" on:click={() => row.file && open(row.file)} title={row.file.path}>
               <span class={statusGlyph(row.file).cls}>{statusGlyph(row.file).glyph}</span>
               <strong>{row.name}</strong>
@@ -124,7 +132,7 @@
       {/each}
     {:else}
       {#each files as file}
-        <div class="file-row" class:active={selectedPath === file.path}>
+        <div class="file-row" class:active={selectedPath === file.path} role="group" on:contextmenu={(event) => onMenu(event, file)}>
           <button class="file-name" on:click={() => open(file)} title={file.path}>
             <span class={statusGlyph(file).cls}>{statusGlyph(file).glyph}</span>
             <strong>{#if dirOf(file.path)}<i>{dirOf(file.path)}</i>{/if}{baseOf(file.path)}</strong>
