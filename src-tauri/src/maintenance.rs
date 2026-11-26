@@ -6,7 +6,8 @@
 //   on large repositories;
 // - loose objects packed;
 // - packs merged geometrically, so the pack count stays logarithmic without
-//   rewriting the whole repository.
+//   rewriting the whole repository. Older git has no geometric repack
+//   task, so there it falls back to the incremental repack.
 // git takes its own maintenance lock, so a run started elsewhere (a
 // scheduled `git maintenance`, another app) makes this one exit quietly.
 
@@ -14,7 +15,9 @@ use super::*;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-const TASKS: [&str; 3] = ["--task=commit-graph", "--task=loose-objects", "--task=geometric-repack"];
+const TASKS: [&str; 2] = ["--task=commit-graph", "--task=loose-objects"];
+const REPACK: &str = "--task=geometric-repack";
+const OLDER_REPACK: &str = "--task=incremental-repack";
 
 fn started() -> &'static Mutex<HashSet<PathBuf>> {
     static STARTED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -22,9 +25,17 @@ fn started() -> &'static Mutex<HashSet<PathBuf>> {
 }
 
 pub(crate) fn run(root: &Path) -> GitResult {
-    let mut args = vec!["maintenance", "run", "--quiet"];
-    args.extend(TASKS);
-    run_git(root, &args)
+    let with = |repack: &'static str| {
+        let mut args = vec!["maintenance", "run", "--quiet"];
+        args.extend(TASKS);
+        args.push(repack);
+        run_git(root, &args)
+    };
+    let result = with(REPACK);
+    if !result.ok && result.stderr.contains("not a valid task") {
+        return with(OLDER_REPACK);
+    }
+    result
 }
 
 /// Starts maintenance for `root` on a background thread, unless it already
