@@ -1097,7 +1097,11 @@
     }
   }
 
-  async function openRepositoryPath(path: string, silent = false) {
+  // Commit messages are typed verbatim: without this the macOS web view turns
+  // "--" into an em dash and straight quotes into curly ones.
+  const plainText: Record<string, string> = { spellcheck: "false", autocorrect: "off", autocapitalize: "off" };
+
+  async function openRepositoryPath(path: string, silent = false): Promise<boolean> {
     busy = true;
     error = "";
     notice = "";
@@ -1110,8 +1114,10 @@
       centerMode = "graph";
       syncRepoTab(state.root, state.root.split("/").filter(Boolean).at(-1) ?? "repo");
       if (!silent) notice = `Opened ${state.root}`;
+      return true;
     } catch (err) {
       error = String(err);
+      return false;
     } finally {
       busy = false;
     }
@@ -2428,8 +2434,11 @@
     await initClonePath();
     const last = recentRepos[0];
     if (isDemo) await refresh();
-    else if (last) await openRepositoryPath(last.path, true);
+    else if (last && (await openRepositoryPath(last.path, true))) return;
     else {
+      // A last repository that was moved or deleted lands on the launchpad,
+      // not on an empty repository view.
+      if (last) error = `Couldn't reopen ${last.path}: ${error}`;
       activeTabId = "launchpad";
       centerMode = "launchpad";
     }
@@ -3579,6 +3588,7 @@
                 bind:value={commitMessage}
                 maxlength="72"
                 placeholder="Commit summary"
+                {...plainText}
                 on:keydown={(event) => {
                   if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && commitMessage.trim()) {
                     event.preventDefault();
@@ -3592,6 +3602,7 @@
               class="description"
               bind:value={commitDescription}
               placeholder="Description"
+              {...plainText}
               on:keydown={(event) => {
                 if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && commitMessage.trim()) {
                   event.preventDefault();
