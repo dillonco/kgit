@@ -10,8 +10,15 @@ use tauri::State;
 mod cleanup;
 mod clone;
 mod compare;
+mod ai;
 mod gh;
+mod hub;
+mod maintenance;
+mod manage;
+mod queries;
 mod rebase;
+mod watch;
+mod workspace;
 #[cfg(test)]
 mod test_support;
 
@@ -19,6 +26,8 @@ struct AppState {
     repo_root: Mutex<PathBuf>,
     /// Set while a clone runs; `cancel_clone` flips it.
     clone_cancel: Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+    /// Watches the open repository; replaced when another one opens.
+    watcher: Mutex<Option<watch::RepoWatcher>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,10 +87,13 @@ pub struct Worktree {
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryState {
     root: String,
+    git_dir: String,
     current_branch: Option<String>,
     head: String,
     merging: bool,
     rebasing: bool,
+    cherry_picking: bool,
+    reverting: bool,
     files: Vec<FileStatus>,
     branches: Vec<Branch>,
     remotes: Vec<String>,
@@ -91,6 +103,7 @@ pub struct RepositoryState {
     worktrees: Vec<Worktree>,
     stashes: Vec<StashEntry>,
     user_name: Option<String>,
+    user_email: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,61 +197,200 @@ fn get_repository_state(state: State<'_, AppState>) -> Result<RepositoryState, S
     repository_state(&root)
 }
 
-fn repository_state(root: &Path) -> Result<RepositoryState, String> {
-    let current_branch = git_optional(root, &["branch", "--show-current"])?;
-    let head = git_optional(root, &["rev-parse", "--short", "HEAD"])?
-        .unwrap_or_else(|| "unborn".to_string());
-    let git_dir = root.join(".git");
+/// The repository's own git directory. In a linked worktree `.git` is a file
+/// pointing at `<main>/.git/worktrees/<name>`, which is where that worktree's
+/// MERGE_HEAD and rebase state live, so `root.join(".git")` is wrong there.
+pub(crate) fn git_dir(root: &Path) -> PathBuf {
+    git_optional(root, &["rev-parse", "--absolute-git-dir"])
+        .ok()
+        .flatten()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join(".git"))
+}
 
-    Ok(RepositoryState {
-        root: root.display().to_string(),
+/// Working-tree status plus the in-progress merge/rebase flags: the part of
+/// the state that changes on every save, refreshed on its own when only the
+/// working tree changed.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeStatus {
+    current_branch: Option<String>,
+    head: String,
+    merging: bool,
+    rebasing: bool,
+    cherry_picking: bool,
+    reverting: bool,
+    files: Vec<FileStatus>,
+}
+
+#[tauri::command(async)]
+fn get_worktree_status(state: State<'_, AppState>) -> Result<WorktreeStatus, String> {
+    let root = active_repo(&state)?;
+    worktree_status(&root, &git_dir(&root))
+}
+
+fn worktree_status(root: &Path, git_dir: &Path) -> Result<WorktreeStatus, String> {
+    // One `status --branch` call yields the branch, HEAD and every file.
+    // --no-optional-locks: don't rewrite the index's stat cache. A read that
+    // writes would wake the file watcher and refresh forever.
+    let out = git(root, &["--no-optional-locks", "status", "--porcelain=v2", "--branch"])?;
+    let mut current_branch = None;
+    let mut head = "unborn".to_string();
+    for line in out.lines() {
+        if let Some(name) = line.strip_prefix("# branch.head ") {
+            current_branch = (name != "(detached)").then(|| name.to_string());
+        } else if let Some(oid) = line.strip_prefix("# branch.oid ") {
+            if oid != "(initial)" {
+                head = oid.chars().take(7).collect();
+            }
+        }
+    }
+    Ok(WorktreeStatus {
         current_branch,
         head,
         merging: git_dir.join("MERGE_HEAD").exists(),
         rebasing: git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists(),
-        files: parse_status(&git(&root, &["status", "--porcelain=v2"])?),
-        branches: parse_branches(&git(
-            &root,
-            &[
-                "branch",
-                "--format=%(HEAD)%09%(refname:short)%09%(upstream:short)%09%(upstream:track,nobracket)%09%(committerdate:unix)%09%(committerdate:relative)",
-            ],
-        )?),
-        remotes: git(&root, &["remote"])?
+        cherry_picking: git_dir.join("CHERRY_PICK_HEAD").exists(),
+        reverting: git_dir.join("REVERT_HEAD").exists(),
+        files: parse_status(&out),
+    })
+}
+
+/// Branches, remote branches and tags from a single `for-each-ref`.
+struct Refs {
+    branches: Vec<Branch>,
+    remote_branches: Vec<String>,
+    tags: Vec<String>,
+}
+
+const REFS_FORMAT: &str = "--format=%(refname)%09%(HEAD)%09%(refname:lstrip=2)%09%(upstream:short)%09%(upstream:track,nobracket)%09%(committerdate:unix)%09%(committerdate:relative)%09%(creatordate:unix)";
+
+fn parse_refs(out: &str) -> Refs {
+    let mut branch_lines = Vec::new();
+    let mut remote_branches = Vec::new();
+    let mut tags: Vec<(i64, String)> = Vec::new();
+    for line in out.lines() {
+        let Some((refname, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split('\t').collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        if refname.starts_with("refs/heads/") {
+            // parse_branches reads `git branch --format` lines: the same
+            // fields minus the refname and creator date.
+            branch_lines.push(fields[..6].join("\t"));
+        } else if refname.starts_with("refs/remotes/") {
+            if !fields[1].ends_with("/HEAD") {
+                remote_branches.push(fields[1].to_string());
+            }
+        } else if refname.starts_with("refs/tags/") {
+            tags.push((fields[6].trim().parse().unwrap_or(0), fields[1].to_string()));
+        }
+    }
+    // Newest tag first, as `git tag --sort=-creatordate` listed them.
+    tags.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    Refs {
+        branches: parse_branches(&branch_lines.join("\n")),
+        remote_branches,
+        tags: tags.into_iter().map(|(_, name)| name).collect(),
+    }
+}
+
+pub(crate) fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, Result<T, String>>) -> Result<T, String> {
+    handle.join().map_err(|_| "git worker panicked".to_string())?
+}
+
+fn remote_names(remote_v: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for line in remote_v.lines() {
+        if let Some((name, _)) = line.split_once('\t') {
+            if !names.iter().any(|existing| existing == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+fn repository_state(root: &Path) -> Result<RepositoryState, String> {
+    let git_dir = git_dir(root);
+    // The reads are independent, so run them side by side: a refresh costs
+    // one git round trip of latency instead of one per query.
+    let (status, refs, remote_v, worktrees, stashes, identity) = std::thread::scope(|scope| {
+        let status = scope.spawn(|| worktree_status(root, &git_dir));
+        let refs = scope.spawn(|| git(root, &["for-each-ref", REFS_FORMAT, "refs/heads", "refs/remotes", "refs/tags"]));
+        let remote_v = scope.spawn(|| git(root, &["remote", "-v"]));
+        let worktrees = scope.spawn(|| git(root, &["worktree", "list", "--porcelain"]));
+        let stashes = scope.spawn(|| git(root, &["stash", "list"]));
+        let identity = scope.spawn(|| git_optional(root, &["config", "--get-regexp", "^user\\.(name|email)$"]));
+        Ok::<_, String>((
+            joined(status)?,
+            joined(refs)?,
+            joined(remote_v)?,
+            joined(worktrees)?,
+            joined(stashes)?,
+            joined(identity)?,
+        ))
+    })?;
+    let refs = parse_refs(&refs);
+    let identity = identity.unwrap_or_default();
+    // --get-regexp lists every scope (system, global, local); the last one wins.
+    let config_value = |key: &str| {
+        identity
             .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(ToOwned::to_owned)
-            .collect(),
-        remote_urls: parse_remote_urls(&git(&root, &["remote", "-v"])?),
-        remote_branches: git(&root, &["branch", "-r", "--format=%(refname:short)"])?
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.ends_with("/HEAD"))
-            .map(ToOwned::to_owned)
-            .collect(),
-        tags: git(&root, &["tag", "--sort=-creatordate"])?
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(ToOwned::to_owned)
-            .collect(),
-        worktrees: parse_worktrees(&git(&root, &["worktree", "list", "--porcelain"])?, root),
-        stashes: parse_stashes(&git(&root, &["stash", "list"])?),
-        user_name: git_optional(&root, &["config", "user.name"])?,
+            .rev()
+            .find_map(|line| line.strip_prefix(key).map(|value| value.trim().to_string()))
+            .filter(|value| !value.is_empty())
+    };
+
+    Ok(RepositoryState {
+        root: root.display().to_string(),
+        git_dir: git_dir.display().to_string(),
+        current_branch: status.current_branch,
+        head: status.head,
+        merging: status.merging,
+        rebasing: status.rebasing,
+        cherry_picking: status.cherry_picking,
+        reverting: status.reverting,
+        files: status.files,
+        branches: refs.branches,
+        remotes: remote_names(&remote_v),
+        remote_urls: parse_remote_urls(&remote_v),
+        remote_branches: refs.remote_branches,
+        tags: refs.tags,
+        worktrees: parse_worktrees(&worktrees, root),
+        stashes: parse_stashes(&stashes),
+        user_name: config_value("user.name "),
+        user_email: config_value("user.email "),
     })
 }
 
 #[tauri::command(async)]
-fn get_commit_graph(state: State<'_, AppState>, limit: usize) -> Result<CommitGraph, String> {
+fn get_commit_graph(state: State<'_, AppState>, limit: usize, skip: Option<usize>) -> Result<CommitGraph, String> {
     let root = active_repo(&state)?;
-    commit_graph(&root, limit)
+    commit_graph_page(&root, limit, skip.unwrap_or(0))
 }
 
 /// Shared by the graph, compare and rebase logs so `parse_commit_graph` reads all three.
 const COMMIT_LOG_FORMAT: &str = "%H%x1f%P%x1f%D%x1f%an%x1f%ae%x1f%ct%x1f%ar%x1f%s%x1f%b%x1e";
 
+#[cfg(test)]
 fn commit_graph(root: &Path, limit: usize) -> Result<CommitGraph, String> {
-    let limit = limit.clamp(25, 1000).to_string();
+    commit_graph_page(root, limit, 0)
+}
+
+/// Upper bound on one page. The UI pages in as you scroll and, on refresh,
+/// re-reads everything already loaded in one call, so this caps how much
+/// history a single refresh can carry (~430 bytes of IPC JSON per commit).
+const GRAPH_PAGE_MAX: usize = 20_000;
+
+/// One page of the graph: `limit` commits after skipping the newest `skip`.
+/// Pages line up because the order (--date-order over --all) is stable.
+fn commit_graph_page(root: &Path, limit: usize, skip: usize) -> Result<CommitGraph, String> {
+    let limit = limit.clamp(1, GRAPH_PAGE_MAX).to_string();
+    let skip = format!("--skip={skip}");
     let format_arg = format!("--format={COMMIT_LOG_FORMAT}");
     // Exclude refs/stash: its synthetic two/three-parent commits render as bogus merges.
     // --date-order, not --topo-order: topo order runs each branch's commits
@@ -252,6 +404,7 @@ fn commit_graph(root: &Path, limit: usize) -> Result<CommitGraph, String> {
             "--all",
             "--date-order",
             &format_arg,
+            &skip,
             "-n",
             &limit,
         ],
@@ -385,9 +538,15 @@ fn run_action(root: &Path, action: &GitAction) -> Result<GitResult, String> {
             );
         }
     }
+    if let Some(result) = manage::run_extended(root, action)? {
+        return Ok(result);
+    }
     let args = action_args(action)?;
     if matches!(action.kind.as_str(), "pull" | "pullMerge" | "pullRebase") {
         return pull(root, &args);
+    }
+    if let Some(input) = action_stdin(action) {
+        return Ok(run_git_with_stdin(root, &args, &input));
     }
     // No terminal is attached, so `merge --continue` / `rebase --continue`
     // would otherwise try to launch an editor: for `merge --continue` to
@@ -402,28 +561,65 @@ fn run_action(root: &Path, action: &GitAction) -> Result<GitResult, String> {
     Ok(run_git(root, &args))
 }
 
-/// `git pull <remote>` with no branch only works when the current branch
-/// tracks a branch on that remote. With an upstream, pull it without naming a
-/// remote so git follows the tracking config; without one, name the remote
-/// branch of the same name explicitly. `args` is `["pull", <flag>, <remote>]`.
+/// Pull as two steps, fetch then merge (or rebase), instead of `git pull`:
+/// a failed fetch is reported as a fetch failure with nothing merged, and the
+/// merge step names exactly what it integrates.
+/// - With an upstream, fetch the upstream's remote and integrate the upstream
+///   (an upstream on the local repository, remote ".", skips the fetch).
+/// - Without one, fetch `remote` and integrate `remote/<branch>` when it
+///   exists, then track it from now on, as `push -u` would.
+/// `args` is `["pull", <flag>, <remote>]`; the flag picks the mode.
 fn pull(root: &Path, args: &[&str]) -> Result<GitResult, String> {
     let (flag, remote) = (args[1], args[2]);
-    if git_optional(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])?.is_some() {
-        return Ok(run_git(root, &["pull", flag]));
-    }
     let Some(branch) = git_optional(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])? else {
         return Ok(command_error("cannot pull with a detached HEAD; check out a branch first"));
     };
-    let remote_ref = format!("refs/remotes/{remote}/{branch}");
-    if git_optional(root, &["rev-parse", "--verify", "--quiet", &remote_ref])?.is_none() {
-        return Ok(command_error(format!(
-            "'{branch}' has no upstream and {remote}/{branch} does not exist; push the branch first, or fetch if it was just created"
-        )));
+    let upstream = git_optional(root, &["rev-parse", "--symbolic-full-name", "@{upstream}"])?;
+    let fetch_remote = match &upstream {
+        Some(_) => git_optional(root, &["config", "--get", &format!("branch.{branch}.remote")])?
+            .unwrap_or_else(|| remote.to_string()),
+        None => remote.to_string(),
+    };
+
+    let mut fetched = String::new();
+    if fetch_remote != "." {
+        let fetch = run_git(root, &["fetch", "--", &fetch_remote]);
+        if !fetch.ok {
+            return Ok(GitResult {
+                stderr: format!("Fetching from {fetch_remote} failed, so nothing was merged.\n{}", fetch.stderr.trim()),
+                ..fetch
+            });
+        }
+        fetched = fetch.stderr.trim().to_string();
     }
-    let result = run_git(root, &["pull", flag, remote, &branch]);
-    if result.ok {
-        // Track it from now on, as push -u would, so later pulls and the
-        // ahead/behind counts follow it. The pull itself already succeeded.
+
+    let target = match &upstream {
+        Some(full) => full.clone(),
+        None => {
+            let remote_ref = format!("refs/remotes/{remote}/{branch}");
+            if git_optional(root, &["rev-parse", "--verify", "--quiet", &remote_ref])?.is_none() {
+                return Ok(command_error(format!(
+                    "'{branch}' has no upstream and {remote} has no branch named '{branch}'; push the branch first"
+                )));
+            }
+            remote_ref
+        }
+    };
+
+    let mut result = match flag {
+        "--ff-only" => run_git(root, &["merge", "--ff-only", &target]),
+        "--no-rebase" => run_git(root, &["merge", "--no-edit", &target]),
+        // `git rebase` with no argument rebases onto the upstream using its
+        // fork point, as `pull --rebase` does; name the target only when
+        // there is no upstream to fall back on.
+        "--rebase" if upstream.is_some() => run_git(root, &["rebase"]),
+        "--rebase" => run_git(root, &["rebase", &target]),
+        other => return Err(format!("unsupported pull mode: {other}")),
+    };
+    if !fetched.is_empty() {
+        result.stdout = format!("{fetched}\n{}", result.stdout);
+    }
+    if result.ok && upstream.is_none() {
         let upstream = format!("{remote}/{branch}");
         run_git(root, &["branch", &format!("--set-upstream-to={upstream}")]);
     }
@@ -554,7 +750,8 @@ fn set_repository_path(state: State<'_, AppState>, path: String) -> Result<Repos
     *state
         .repo_root
         .lock()
-        .map_err(|_| "repository state lock is poisoned".to_string())? = root;
+        .map_err(|_| "repository state lock is poisoned".to_string())? = root.clone();
+    maintenance::start(&root);
     get_repository_state(state)
 }
 
@@ -636,11 +833,16 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState {
-            repo_root: Mutex::new(default_repo_root()),
+            // No repository until the UI opens one: a build-time default would
+            // point every installed copy at the build machine's checkout.
+            repo_root: Mutex::new(PathBuf::new()),
             clone_cancel: Mutex::new(None),
+            watcher: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_repository_state,
+            get_worktree_status,
+            home_dir,
             get_commit_graph,
             get_commit_detail,
             get_commit_tree,
@@ -671,24 +873,66 @@ pub fn run() {
             gh::gh_repo_parent,
             rebase::get_rebase_plan,
             rebase::run_interactive_rebase,
+            watch::watch_repository,
+            queries::check_conflicts,
+            queries::get_base_branch,
+            queries::get_stash_detail,
+            queries::get_stash_file_diff,
+            queries::get_reflog,
+            queries::get_file_history_entries,
+            queries::get_blame_lines,
+            queries::list_files,
+            manage::checkout_with_autostash,
+            manage::get_repo_config,
+            manage::set_config,
+            manage::get_commit_signature,
+            manage::make_patch,
+            manage::apply_patch,
+            manage::write_text_file,
+            manage::read_text_file,
+            manage::open_external,
+            manage::launch_tool,
+            manage::pick_save_path,
+            manage::pick_open_file,
+            hub::gh_pr_list,
+            hub::gh_my_prs,
+            hub::gh_pr_create,
+            hub::gh_pr_checkout,
+            hub::gh_issue_list,
+            hub::issue_branch,
+            hub::share_patch,
+            hub::fetch_shared_patch,
+            hub::open_url,
+            ai::ai_status,
+            ai::ai_set_key,
+            ai::ai_commit_message,
+            ai::ai_explain_commit,
+            ai::ai_resolve_conflicts,
+            workspace::workspace_status,
+            workspace::workspace_run,
         ])
         .run(tauri::generate_context!())
         .expect("error while running kGit");
 }
 
-fn default_repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("src-tauri must live inside the repository")
-        .to_path_buf()
-}
-
 fn active_repo(state: &State<'_, AppState>) -> Result<PathBuf, String> {
-    state
+    let root = state
         .repo_root
         .lock()
         .map(|root| root.clone())
-        .map_err(|_| "repository state lock is poisoned".to_string())
+        .map_err(|_| "repository state lock is poisoned".to_string())?;
+    if root.as_os_str().is_empty() {
+        return Err("No repository is open".to_string());
+    }
+    Ok(root)
+}
+
+/// The user's home directory, for default clone and create locations.
+#[tauri::command]
+fn home_dir() -> Option<String> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| PathBuf::from(home).display().to_string())
 }
 
 fn discover_repo_root(path: &Path) -> Result<PathBuf, String> {
@@ -702,9 +946,7 @@ fn discover_repo_root(path: &Path) -> Result<PathBuf, String> {
 
 /// The branch feature work is measured against: origin/HEAD's target if the
 /// remote advertises one, else a local `main`/`master`, else the current branch.
-/// Unused outside tests until the F1/F2/F4 streams call it; see PLAN.md.
-#[allow(dead_code)]
-fn default_base_branch(root: &Path) -> Result<String, String> {
+pub(crate) fn default_base_branch(root: &Path) -> Result<String, String> {
     if let Some(head) = git_optional(root, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])? {
         if let Some(local) = head.strip_prefix("origin/") {
             if git_optional(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{local}")])?.is_some() {
@@ -753,11 +995,31 @@ fn run_git(root: &Path, args: &[&str]) -> GitResult {
 /// Used by interactive rebase (GIT_SEQUENCE_EDITOR / GIT_EDITOR).
 fn run_git_env(root: &Path, args: &[&str], env: &[(&str, &str)]) -> GitResult {
     let mut command = Command::new("git");
-    command.args(args).current_dir(root);
+    command.args(args).current_dir(root).envs(git_env());
     for (key, value) in env {
         command.env(key, value);
     }
     run_command(&mut command, true)
+}
+
+/// Environment for every git call made in a repository:
+/// - no terminal is attached, so fail fast instead of waiting on a prompt;
+/// - git's own auto-gc and auto-maintenance are off, because they can stall an
+///   action for seconds midway. kGit runs maintenance itself, in the
+///   background, when a repository is opened (`maintenance::start`).
+/// The settings go through `GIT_CONFIG_COUNT` rather than `-c`, so argument
+/// lists stay as they are, and any count already in the environment is
+/// extended instead of replaced.
+pub(crate) fn git_env() -> Vec<(String, String)> {
+    let base: usize = std::env::var("GIT_CONFIG_COUNT").ok().and_then(|value| value.parse().ok()).unwrap_or(0);
+    let mut env = vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
+    let settings = [("gc.auto", "0"), ("maintenance.auto", "0")];
+    for (offset, (key, value)) in settings.iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{}", base + offset), key.to_string()));
+        env.push((format!("GIT_CONFIG_VALUE_{}", base + offset), value.to_string()));
+    }
+    env.push(("GIT_CONFIG_COUNT".to_string(), (base + settings.len()).to_string()));
+    env
 }
 
 fn run_command(command: &mut Command, refresh: bool) -> GitResult {
@@ -771,6 +1033,7 @@ fn run_git_with_stdin(root: &Path, args: &[&str], stdin: &str) -> GitResult {
     let spawn = Command::new("git")
         .args(args)
         .current_dir(root)
+        .envs(git_env())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -813,6 +1076,16 @@ fn command_error(err: impl std::fmt::Display) -> GitResult {
     }
 }
 
+/// What an action feeds git on stdin, for the actions whose `action_args`
+/// read it: a commit message, or one NUL-terminated pathspec.
+fn action_stdin(action: &GitAction) -> Option<String> {
+    match action.kind.as_str() {
+        "commit" | "commitAmend" => action.message.clone(),
+        "stage" | "unstage" | "markResolved" => action.path.as_ref().map(|path| format!("{path}\0")),
+        _ => None,
+    }
+}
+
 fn action_args(action: &GitAction) -> Result<Vec<&str>, String> {
     let path = action.path.as_deref();
     let branch = action.branch.as_deref();
@@ -821,12 +1094,26 @@ fn action_args(action: &GitAction) -> Result<Vec<&str>, String> {
     let message = action.message.as_deref();
 
     let args = match action.kind.as_str() {
-        "stage" => vec!["add", "--", required(path, "path")?],
-        "unstage" => vec!["restore", "--staged", "--", required(path, "path")?],
+        // Paths and messages go on stdin (see `action_stdin`): no argument
+        // length limit, and nothing in them can be read as an option.
+        "stage" => {
+            required(path, "path")?;
+            vec!["add", "--pathspec-from-file=-", "--pathspec-file-nul"]
+        }
+        "unstage" => {
+            required(path, "path")?;
+            vec!["restore", "--staged", "--pathspec-from-file=-", "--pathspec-file-nul"]
+        }
         "discard" => vec!["restore", "--", required(path, "path")?],
         "cleanUntracked" => vec!["clean", "-f", "--", required(path, "path")?],
-        "commit" => vec!["commit", "-m", required(message, "message")?],
-        "commitAmend" => vec!["commit", "--amend", "-m", required(message, "message")?],
+        "commit" => {
+            required(message, "message")?;
+            vec!["commit", "--file=-"]
+        }
+        "commitAmend" => {
+            required(message, "message")?;
+            vec!["commit", "--amend", "--file=-"]
+        }
         "checkoutBranch" => vec!["checkout", required(branch, "branch")?],
         "createBranch" => {
             let mut args = vec!["checkout", "-b", required(branch, "branch")?];
@@ -876,7 +1163,10 @@ fn action_args(action: &GitAction) -> Result<Vec<&str>, String> {
             reset_flag(action.mode.as_deref())?,
             required(target, "target")?,
         ],
-        "markResolved" => vec!["add", "--", required(path, "path")?],
+        "markResolved" => {
+            required(path, "path")?;
+            vec!["add", "--pathspec-from-file=-", "--pathspec-file-nul"]
+        }
         "worktreeAdd" => match action.mode.as_deref().unwrap_or("checkout") {
             // Check out an existing branch into a new worktree directory.
             "checkout" => vec![
@@ -1434,10 +1724,8 @@ u UU N... 100644 100644 100644 100644 a b c d conflicted.txt";
             mode: None,
         };
 
-        assert_eq!(
-            action_args(&action).unwrap(),
-            vec!["commit", "--amend", "-m", "summary\n\ndescription"]
-        );
+        assert_eq!(action_args(&action).unwrap(), vec!["commit", "--amend", "--file=-"]);
+        assert_eq!(action_stdin(&action).as_deref(), Some("summary\n\ndescription"));
     }
 
     fn action(kind: &str) -> GitAction {
@@ -1455,17 +1743,21 @@ u UU N... 100644 100644 100644 100644 a b c d conflicted.txt";
     #[test]
     fn add_and_restore_actions_terminate_options_with_double_dash() {
         // Regression: a file whose name begins with `-` must reach git as an
-        // operand, never as an option. Every add/restore path needs `--`.
+        // operand, never as an option. Paths are either after `--` or on
+        // stdin as a NUL-terminated pathspec, never in the argument list.
         let cases = [
-            ("stage", vec!["add", "--", "-rf"]),
-            ("unstage", vec!["restore", "--staged", "--", "-rf"]),
+            ("stage", vec!["add", "--pathspec-from-file=-", "--pathspec-file-nul"]),
+            ("unstage", vec!["restore", "--staged", "--pathspec-from-file=-", "--pathspec-file-nul"]),
             ("discard", vec!["restore", "--", "-rf"]),
-            ("markResolved", vec!["add", "--", "-rf"]),
+            ("markResolved", vec!["add", "--pathspec-from-file=-", "--pathspec-file-nul"]),
         ];
         for (kind, expected) in cases {
             let mut act = action(kind);
             act.path = Some("-rf".to_string());
             assert_eq!(action_args(&act).unwrap(), expected, "kind {kind}");
+            if kind != "discard" {
+                assert_eq!(action_stdin(&act).as_deref(), Some("-rf\0"), "kind {kind}");
+            }
         }
     }
 
@@ -2378,6 +2670,50 @@ mod git_integration_tests {
     }
 
     #[test]
+    fn pull_fetches_first_and_reports_a_failed_fetch_on_its_own() {
+        let origin = TempRepo::new();
+        write_file(origin.path(), "a.txt", "one\n");
+        commit_all(origin.path(), "seed");
+        let clone_dir = std::env::temp_dir().join(format!("kgit-pull-fetch-{}", std::process::id()));
+        fs::remove_dir_all(&clone_dir).ok();
+        run(
+            std::env::temp_dir().as_path(),
+            &["clone", origin.path().to_str().unwrap(), clone_dir.to_str().unwrap()],
+        );
+        // New upstream work the clone has not fetched: the pull fetches it.
+        write_file(origin.path(), "a.txt", "two\n");
+        commit_all(origin.path(), "origin work");
+        for kind in ["pull", "pullMerge", "pullRebase"] {
+            let result = run_action(&clone_dir, &act(kind)).unwrap();
+            assert!(result.ok, "{kind} failed: {}", result.stderr);
+        }
+        assert_eq!(fs::read_to_string(clone_dir.join("a.txt")).unwrap(), "two\n");
+
+        // An unreachable remote: the error says the fetch failed and nothing merged.
+        run(&clone_dir, &["remote", "set-url", "origin", "/definitely/not/a/remote"]);
+        let result = run_action(&clone_dir, &act("pull")).unwrap();
+        assert!(!result.ok);
+        assert!(result.stderr.contains("nothing was merged"), "{}", result.stderr);
+        fs::remove_dir_all(&clone_dir).ok();
+    }
+
+    #[test]
+    fn commit_messages_go_through_stdin_verbatim() {
+        let repo = TempRepo::new();
+        write_file(repo.path(), "a.txt", "a\n");
+        let mut stage = act("stage");
+        stage.path = Some("a.txt".to_string());
+        assert!(run_action(repo.path(), &stage).unwrap().ok);
+        let mut commit = act("commit");
+        // Starts like an option and spans lines: neither may change it.
+        commit.message = Some("--amend is not a flag here\n\nbody line".to_string());
+        let result = run_action(repo.path(), &commit).unwrap();
+        assert!(result.ok, "{}", result.stderr);
+        let message = run(repo.path(), &["log", "-1", "--format=%B"]).stdout;
+        assert_eq!(message.trim_end(), "--amend is not a flag here\n\nbody line");
+    }
+
+    #[test]
     fn conflicting_merge_can_be_aborted() {
         let repo = TempRepo::new();
         write_file(repo.path(), "file.txt", "base\n");
@@ -2684,5 +3020,108 @@ prunable gitdir file points to non-existent location
         assert_eq!(default_base_branch(&dir).unwrap(), "trunk");
 
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn graph_pages_line_up_without_gaps_or_overlap() {
+        let repo = TempRepo::new();
+        for index in 0..7 {
+            write_file(repo.path(), "a.txt", &format!("{index}\n"));
+            commit_all(repo.path(), &format!("c{index}"));
+        }
+        let all = commit_graph_page(repo.path(), 100, 0).unwrap().commits;
+        let first = commit_graph_page(repo.path(), 3, 0).unwrap().commits;
+        let second = commit_graph_page(repo.path(), 3, 3).unwrap().commits;
+        let rest = commit_graph_page(repo.path(), 3, 6).unwrap().commits;
+        let paged: Vec<String> = first.iter().chain(&second).chain(&rest).map(|c| c.hash.clone()).collect();
+        assert_eq!(paged, all.iter().map(|c| c.hash.clone()).collect::<Vec<_>>());
+        assert_eq!(rest.len(), 1);
+    }
+    use crate::test_support::{commit_all, run, write_file, TempRepo, REPO_COUNTER};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn parse_refs_splits_branches_remotes_and_tags() {
+        let out = [
+            "refs/heads/main\t*\tmain\torigin/main\tahead 1\t1700000000\t2 days ago\t1700000000",
+            "refs/heads/topic\t \ttopic\t\t\t1690000000\t3 months ago\t1690000000",
+            "refs/remotes/origin/HEAD\t \torigin/HEAD\t\t\t0\t\t0",
+            "refs/remotes/origin/main\t \torigin/main\t\t\t1700000000\t2 days ago\t1700000000",
+            "refs/tags/v1\t \tv1\t\t\t1600000000\tlong ago\t1600000000",
+            "refs/tags/v2\t \tv2\t\t\t1650000000\tlong ago\t1650000000",
+        ]
+        .join("\n");
+        let refs = parse_refs(&out);
+        assert_eq!(refs.branches.len(), 2);
+        assert!(refs.branches[0].current);
+        assert_eq!(refs.branches[0].ahead, 1);
+        assert_eq!(refs.remote_branches, vec!["origin/main"]);
+        assert_eq!(refs.tags, vec!["v2", "v1"]);
+    }
+
+    #[test]
+    fn remote_names_keep_first_seen_order_without_duplicates() {
+        let out = "origin\tgit@x:a.git (fetch)\norigin\tgit@x:a.git (push)\nupstream\tgit@x:b.git (fetch)";
+        assert_eq!(remote_names(out), vec!["origin", "upstream"]);
+    }
+
+    #[test]
+    fn state_reports_identity_and_branch_names_with_slashes() {
+        let repo = TempRepo::new();
+        write_file(repo.path(), "a.txt", "one\n");
+        commit_all(repo.path(), "init");
+        run(repo.path(), &["branch", "feature/deep/name"]);
+        let state = repository_state(repo.path()).unwrap();
+        assert_eq!(state.user_email.as_deref(), Some("test@kgit.dev"));
+        assert!(state.branches.iter().any(|b| b.name == "feature/deep/name"));
+        assert_eq!(state.head.len(), 7);
+        assert_eq!(state.current_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn merge_in_progress_is_reported_inside_a_linked_worktree() {
+        let repo = TempRepo::new();
+        write_file(repo.path(), "file.txt", "base\n");
+        commit_all(repo.path(), "base");
+        run(repo.path(), &["branch", "other"]);
+        write_file(repo.path(), "file.txt", "main side\n");
+        commit_all(repo.path(), "main side");
+
+        let linked = std::env::temp_dir().join(format!(
+            "kgit-test-wt-merge-{}-{}",
+            std::process::id(),
+            REPO_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        run(repo.path(), &["worktree", "add", &linked.display().to_string(), "other"]);
+        write_file(&linked, "file.txt", "other side\n");
+        commit_all(&linked, "other side");
+        assert!(!run_git(&linked, &["merge", "main"]).ok, "merge must conflict");
+
+        // `.git` is a file in a linked worktree; the state must still see MERGE_HEAD.
+        assert!(linked.join(".git").is_file());
+        let state = repository_state(&linked).unwrap();
+        assert!(state.merging, "merge banner must show in a linked worktree");
+        assert!(!repository_state(repo.path()).unwrap().merging);
+
+        run(&linked, &["merge", "--abort"]);
+        run(repo.path(), &["worktree", "remove", "--force", &linked.display().to_string()]);
+    }
+
+    #[test]
+    fn worktree_status_matches_the_full_state() {
+        let repo = TempRepo::new();
+        write_file(repo.path(), "a.txt", "one\n");
+        commit_all(repo.path(), "init");
+        write_file(repo.path(), "a.txt", "two\n");
+        let quick = worktree_status(repo.path(), &git_dir(repo.path())).unwrap();
+        let full = repository_state(repo.path()).unwrap();
+        assert_eq!(quick.files.len(), full.files.len());
+        assert_eq!(quick.head, full.head);
+        assert_eq!(quick.current_branch, full.current_branch);
     }
 }

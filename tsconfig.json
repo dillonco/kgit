@@ -12,5 +12,8 @@
     "noEmit": true,
     "types": ["svelte", "vite/client"]
   },
-  "include": ["src/**/*.ts", "src/**/*.svelte", "vite.config.ts"]
+  "include": ["src/**/*.ts", "src/**/*.svelte", "vite.config.ts"],
+  // Tests that drive the real git CLI run under Node in vitest; they are
+  // excluded here so Node's globals never leak into the browser code's types.
+  "exclude": ["src/**/*.git.test.ts"]
 }

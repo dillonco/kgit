@@ -1,5 +1,18 @@
 import type {
+  AiStatus,
+  CommitExplanation,
+  ConflictProposal,
+  Issue,
+  PullRequest,
+  RepoSummary,
+  WorkspaceResult,
+  BlameLine,
   BranchCleanupReport,
+  ConflictCheck,
+  FileHistoryEntry,
+  ReflogEntry,
+  RepoConfig,
+  Signature,
   CloneProgress,
   CloneRequest,
   CloneTarget,
@@ -16,6 +29,7 @@ import type {
   RebaseStep,
   RefCompare,
   RepositoryState,
+  WorktreeStatus,
 } from "./types";
 
 // When the UI runs in a plain browser (`npm run dev:ui`) there is no Tauri
@@ -23,7 +37,10 @@ import type {
 // This keeps the full UI testable for design work without a Rust build.
 const hasTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+/** True in the browser-only demo build, where every call hits the fake repo. */
+export const isDemo = !hasTauri;
+
+export async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (hasTauri) {
     const { invoke } = await import("@tauri-apps/api/core");
     return invoke<T>(command, args);
@@ -36,8 +53,17 @@ export function getRepositoryState(): Promise<RepositoryState> {
   return call("get_repository_state");
 }
 
-export function getCommitGraph(limit = 250): Promise<CommitGraph> {
-  return call("get_commit_graph", { limit });
+export function getWorktreeStatus(): Promise<WorktreeStatus> {
+  return call("get_worktree_status");
+}
+
+export function homeDir(): Promise<string | null> {
+  return call("home_dir");
+}
+
+/** `limit` commits of the graph after skipping the newest `skip`. */
+export function getCommitGraph(limit = 500, skip = 0): Promise<CommitGraph> {
+  return call("get_commit_graph", { limit, skip });
 }
 
 export function getCommitDetail(hash: string): Promise<CommitDetail> {
@@ -170,4 +196,168 @@ export function getRebasePlan(base: string | null): Promise<RebasePlan> {
 
 export function runInteractiveRebase(base: string, steps: RebaseStep[]): Promise<GitResult> {
   return call("run_interactive_rebase", { base, steps });
+}
+
+/** Test-merges `target` into HEAD without touching the tree. */
+export function checkConflicts(target: string): Promise<ConflictCheck> {
+  return call("check_conflicts", { target });
+}
+
+/** The branch `branch` was created from (per its reflog), else the repository default. */
+export function getBaseBranch(branch?: string | null): Promise<string> {
+  return call("get_base_branch", { branch: branch ?? null });
+}
+
+export function getStashDetail(name: string): Promise<CommitDetail> {
+  return call("get_stash_detail", { name });
+}
+
+export function getStashFileDiff(name: string, path: string): Promise<FileDiff> {
+  return call("get_stash_file_diff", { name, path });
+}
+
+export function getReflog(limit = 200): Promise<ReflogEntry[]> {
+  return call("get_reflog", { limit });
+}
+
+export function getFileHistoryEntries(path: string): Promise<FileHistoryEntry[]> {
+  return call("get_file_history_entries", { path });
+}
+
+export function getBlameLines(path: string): Promise<BlameLine[]> {
+  return call("get_blame_lines", { path });
+}
+
+export function listFiles(): Promise<string[]> {
+  return call("list_files");
+}
+
+/** Checks out `branch`, stashing local changes first and restoring them after. */
+export function checkoutWithAutostash(branch: string): Promise<GitResult> {
+  return call("checkout_with_autostash", { branch });
+}
+
+export function getRepoConfig(): Promise<RepoConfig> {
+  return call("get_repo_config");
+}
+
+/** Writes (or, with an empty value, unsets) an allow-listed git config key. */
+export function setConfig(key: string, value: string | null, global = false): Promise<GitResult> {
+  return call("set_config", { key, value, global });
+}
+
+export function getCommitSignature(hash: string): Promise<Signature> {
+  return call("get_commit_signature", { hash });
+}
+
+/** source: "commit" | "range" | "staged" | "worktree" */
+export function makePatch(source: string, target: string | null = null): Promise<string> {
+  return call("make_patch", { source, target });
+}
+
+export function applyPatch(patch: string, index = false): Promise<GitResult> {
+  return call("apply_patch", { patch, index });
+}
+
+export function writeTextFile(path: string, content: string): Promise<void> {
+  return call("write_text_file", { path, content });
+}
+
+export function readTextFile(path: string): Promise<string> {
+  return call("read_text_file", { path });
+}
+
+/** Opens the repo (or a file in it) in `app`, or reveals it in the file manager. */
+export function openExternal(app: string | null, path: string | null = null, reveal = false): Promise<GitResult> {
+  return call("open_external", { app, path, reveal });
+}
+
+export function launchTool(kind: "diff" | "merge", path: string, tool: string | null = null): Promise<GitResult> {
+  return call("launch_tool", { kind, path, tool });
+}
+
+export function pickSavePath(prompt: string, defaultName: string): Promise<string | null> {
+  return call("pick_save_path", { prompt, defaultName });
+}
+
+export function pickOpenFile(prompt: string): Promise<string | null> {
+  return call("pick_open_file", { prompt });
+}
+
+// ---- GitHub: pull requests, issues, shared patches (through gh) ----
+
+export function ghPrList(): Promise<PullRequest[]> {
+  return call("gh_pr_list");
+}
+
+/** [opened by you, awaiting your review], across every repository. */
+export function ghMyPrs(): Promise<[PullRequest[], PullRequest[]]> {
+  return call("gh_my_prs");
+}
+
+export function ghPrCreate(title: string, body: string, base: string, head: string, draft: boolean): Promise<string> {
+  return call("gh_pr_create", { title, body, base, head, draft });
+}
+
+export function ghPrCheckout(number: number): Promise<GitResult> {
+  return call("gh_pr_checkout", { number });
+}
+
+export function ghIssueList(mine: boolean): Promise<Issue[]> {
+  return call("gh_issue_list", { mine });
+}
+
+export function issueBranch(number: number, title: string): Promise<string> {
+  return call("issue_branch", { number, title });
+}
+
+/** Uploads a patch as a gist (secret unless `isPublic`) and returns its URL. */
+export function sharePatch(patch: string, name: string, description: string, isPublic = false): Promise<string> {
+  return call("share_patch", { patch, name, description, public: isPublic });
+}
+
+export function fetchSharedPatch(link: string): Promise<string> {
+  return call("fetch_shared_patch", { link });
+}
+
+export function openUrl(url: string): Promise<void> {
+  return call("open_url", { url });
+}
+
+// ---- AI (Claude API) ----
+
+export function aiStatus(): Promise<AiStatus> {
+  return call("ai_status");
+}
+
+/** Saves the key in the keychain; an empty key removes it. */
+export function aiSetKey(key: string): Promise<void> {
+  return call("ai_set_key", { key });
+}
+
+export function aiCommitMessage(model: string | null): Promise<{ subject: string; body: string }> {
+  return call("ai_commit_message", { model });
+}
+
+export function aiExplainCommit(hash: string, model: string | null): Promise<CommitExplanation> {
+  return call("ai_explain_commit", { hash, model });
+}
+
+export function aiResolveConflicts(
+  path: string,
+  file: string,
+  regions: { index: number; ours: string; theirs: string; base: string | null }[],
+  model: string | null,
+): Promise<ConflictProposal> {
+  return call("ai_resolve_conflicts", { path, file, regions, model });
+}
+
+// ---- workspaces ----
+
+export function workspaceStatus(paths: string[]): Promise<RepoSummary[]> {
+  return call("workspace_status", { paths });
+}
+
+export function workspaceRun(paths: string[], kind: "fetch" | "pull"): Promise<WorkspaceResult[]> {
+  return call("workspace_run", { paths, kind });
 }

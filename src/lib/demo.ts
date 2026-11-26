@@ -591,10 +591,13 @@ function fail(stderr: string): GitResult {
 function repositoryState(): RepositoryState {
   return {
     root: demo.root,
+    gitDir: `${demo.root}/.git`,
     currentBranch: demo.currentBranch,
     head: demoCommits[0].shortHash,
     merging: demo.merging,
     rebasing: demo.rebasing,
+    cherryPicking: false,
+    reverting: false,
     files: demo.files.map((entry) => ({ ...entry })),
     branches: demo.branches.map((entry) => ({ ...entry })),
     remotes: ["origin"],
@@ -604,6 +607,7 @@ function repositoryState(): RepositoryState {
     worktrees: demo.worktrees.map((entry) => ({ ...entry, current: entry.path === demo.root })),
     stashes: demo.stashes.map((entry) => ({ ...entry })),
     userName: "Christine Ware",
+    userEmail: "christine@wareness.dev",
   };
 }
 
@@ -895,7 +899,8 @@ function runAction(action: GitAction): GitResult {
     case "reset":
       return ok();
     default:
-      return fail(`demo backend: unknown action '${action.kind}'`);
+      // Actions added after the demo was written succeed without changing it.
+      return ok();
   }
 }
 
@@ -1121,8 +1126,19 @@ export async function demoInvoke<T>(command: string, args: Record<string, unknow
   switch (command) {
     case "get_repository_state":
       return repositoryState() as T;
-    case "get_commit_graph":
-      return { commits: demoCommits.map(({ date, body, files, ...node }) => ({ ...node })) } as T;
+    case "get_worktree_status": {
+      const { root, gitDir, branches, remotes, remoteUrls, remoteBranches, tags, worktrees, stashes, userName, userEmail, ...status } =
+        repositoryState();
+      return status as T;
+    }
+    case "home_dir":
+      return "/Users/christine" as T;
+    case "get_commit_graph": {
+      const skip = Number(args.skip ?? 0);
+      const limit = Number(args.limit ?? demoCommits.length);
+      const page = demoCommits.slice(skip, skip + limit);
+      return { commits: page.map(({ date, body, files, ...node }) => ({ ...node })) } as T;
+    }
     case "get_commit_detail": {
       const found = demoCommits.find((entry) => entry.hash === args.hash) ?? resolveDemoRef(String(args.hash));
       if (!found) throw new Error(`unknown commit ${String(args.hash)}`);
@@ -1258,7 +1274,73 @@ export async function demoInvoke<T>(command: string, args: Record<string, unknow
       return rebasePlan((args.base as string | null | undefined) ?? null) as T;
     case "run_interactive_rebase":
       return runInteractiveRebase(String(args.base), args.steps as RebaseStep[]) as T;
-    default:
-      throw new Error(`demo backend: unknown command '${command}'`);
+    case "check_conflicts": {
+      const target = String(args.target);
+      // The demo's feature branch drifts into conflict with main in one file.
+      const conflicts = target.endsWith("main") && demo.currentBranch !== "main";
+      return { target, supported: true, upToDate: false, conflicts, files: conflicts ? ["src/App.svelte"] : [] } as T;
+    }
+    case "get_base_branch":
+      return "main" as T;
+    case "get_stash_detail": {
+      const name = String(args.name);
+      const stash = demo.stashes.find((entry) => entry.name === name);
+      if (!stash) throw new Error(`unknown stash ${name}`);
+      const base = demoCommits[0];
+      return {
+        hash: h(0x5a),
+        shortHash: h(0x5a).slice(0, 8),
+        parents: [base.hash],
+        refs: [],
+        author: base.author,
+        email: base.email,
+        date: base.date,
+        relativeDate: "1 hour ago",
+        subject: stash.message,
+        body: "",
+        files: [{ status: "M", path: "src/App.svelte" }, { status: "A", path: "notes/scratch.md" }],
+      } as T;
+    }
+    case "get_stash_file_diff": {
+      const path = String(args.path);
+      return { path, staged: false, diff: demoDiffs[path] ?? `diff --git a/${path} b/${path}\nnew file mode 100644\n--- /dev/null\n+++ b/${path}\n@@ -0,0 +1,2 @@\n+scratch notes\n+kept in a stash\n`, binary: false } as T;
+    }
+    case "get_reflog":
+      return demoCommits.slice(0, 8).map((entry, index) => ({
+        hash: entry.hash,
+        shortHash: entry.shortHash,
+        selector: `HEAD@{${index}}`,
+        action: index === 2 ? "checkout" : index === 4 ? "reset" : "commit",
+        message: index === 2 ? "moving from main to feature/commit-details" : entry.subject,
+        relativeDate: entry.relativeDate,
+      })) as T;
+    case "get_file_history_entries":
+      return demoCommits
+        .filter((entry) => entry.files.some((file) => file.path === String(args.path)))
+        .concat(demoCommits.slice(0, 3))
+        .slice(0, 6)
+        .map((entry, index) => ({
+          hash: entry.hash,
+          shortHash: entry.shortHash,
+          author: entry.author,
+          email: entry.email,
+          relativeDate: entry.relativeDate,
+          subject: entry.subject,
+          path: index === 5 ? `old/${String(args.path)}` : String(args.path),
+          status: index === 5 ? "A" : "M",
+        })) as T;
+    case "get_blame_lines": {
+      const text = ["<script lang=\"ts\">", "  import { onMount } from \"svelte\";", "", "  let state = null;", "  let commits = [];", "</script>"];
+      return text.map((line, index) => {
+        const entry = demoCommits[index < 2 ? 6 : index < 4 ? 2 : 0];
+        return { hash: entry.hash, shortHash: entry.shortHash, author: entry.author, summary: entry.subject, time: entry.timestamp, line: index + 1, text: line };
+      }) as T;
+    }
+    default: {
+      const { demoExtraInvoke, UNHANDLED } = await import("./demoExtras");
+      const result = await demoExtraInvoke(command, args);
+      if (result === UNHANDLED) throw new Error(`demo backend: unknown command '${command}'`);
+      return result as T;
+    }
   }
 }

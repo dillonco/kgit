@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildGraphRows, githubOwner, githubOwnerAvatar, groupRefs, isGithubUrl, relativeBucket } from "./graph";
+import { buildGraphRows, graphPaths, githubOwner, githubOwnerAvatar, groupRefs, isGithubUrl, relativeBucket } from "./graph";
 import type { CommitNode } from "./types";
 
 describe("isGithubUrl", () => {
@@ -160,5 +160,33 @@ describe("relativeBucket", () => {
     expect(relativeBucket(3 * 24 * hours)).toBe("3 days ago");
     expect(relativeBucket(10 * 24 * hours)).toBe("last week");
     expect(relativeBucket(70 * 24 * hours)).toBe("2 months ago");
+  });
+});
+
+describe("graphPaths", () => {
+  // merge M (parents A, B); A and B both come from root R.
+  const rows = buildGraphRows([node("M", ["A", "B"]), node("A", ["R"]), node("B", ["R"]), node("R", [])]);
+  const byRow = (hash: string) => graphPaths(rows.find((row) => row.commit.hash === hash)!).map((path) => path.d);
+
+  it("draws a merge as a line across, an 8px arc down and on into the parent lane", () => {
+    expect(byRow("M")).toEqual([
+      "M 38 14 V 29", // lane 0 starts at the merge node and runs down
+      "M 38 14 H 52 A 8 8 0 0 1 60 22 V 29", // across to lane 1, arc, down
+    ]);
+  });
+
+  it("draws a lane that ends at a node as a line down that curves into it", () => {
+    expect(byRow("R")).toContain("M 60 -1 V 6 A 8 8 0 0 1 52 14 H 38");
+    // The root's own lane ends at its node.
+    expect(byRow("R")).toContain("M 38 -1 V 14");
+  });
+
+  it("runs pass-through lanes the full row height", () => {
+    expect(byRow("A")).toEqual(["M 38 -1 V 29", "M 60 -1 V 29"]);
+  });
+
+  it("draws nothing for a lone commit with no parents and nothing above", () => {
+    const [only] = buildGraphRows([node("X", [])]);
+    expect(graphPaths(only)).toEqual([]);
   });
 });

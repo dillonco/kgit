@@ -1704,43 +1704,18 @@ small {
   background: var(--lane-color);
 }
 
-.graph-rail {
+/* Lanes, merge edges and joins for one row, as SVG paths from graphPaths()
+   in lib/graph.ts, which also holds the geometry they assume. */
+.graph-lines {
   position: absolute;
-  top: -2px;
-  bottom: -2px;
-  left: calc(var(--lane-center) - 1px + var(--lane) * var(--lane-pitch));
+  inset: 0;
   z-index: 1;
-  width: 2px;
-  background: var(--lane-color);
-}
-
-.graph-rail.rail-start {
-  top: 50%;
-}
-
-.graph-rail.rail-end {
-  bottom: 50%;
-}
-
-.graph-edge {
-  position: absolute;
-  top: calc(50% - 1px);
-  bottom: -2px;
-  left: calc(var(--lane-center) + var(--from) * var(--lane-pitch));
-  z-index: 2;
-  width: calc(var(--span) * var(--lane-pitch) + 1px);
-  border-top: 2px solid var(--lane-color);
-}
-
-.graph-edge.edge-right {
-  border-right: 2px solid var(--lane-color);
-  border-top-right-radius: 11px;
-}
-
-.graph-edge.edge-left {
-  left: calc(var(--lane-center) - 1px + var(--from) * var(--lane-pitch));
-  border-left: 2px solid var(--lane-color);
-  border-top-left-radius: 11px;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+  fill: none;
+  stroke-width: 2;
 }
 
 .commit-dot {
@@ -1760,22 +1735,6 @@ small {
   font-size: 9px;
   font-weight: 500;
   letter-spacing: 0;
-}
-
-/* A lane that ends at this commit: down its own column, then a rounded turn
-   into the node. Only lanes to the node's right end here, because the node
-   always takes the leftmost lane that was waiting for it. */
-.graph-join {
-  position: absolute;
-  top: -2px;
-  /* down to the node's centre line, plus 1px so the 2px bottom border straddles it */
-  height: calc(50% + 3px);
-  left: calc(var(--lane-center) + var(--from) * var(--lane-pitch));
-  z-index: 2;
-  width: calc(var(--span) * var(--lane-pitch) + 1px);
-  border-right: 2px solid var(--lane-color);
-  border-bottom: 2px solid var(--lane-color);
-  border-bottom-right-radius: 11px;
 }
 
 /* Merges carry no author, so they draw as a small solid dot. */

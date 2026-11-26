@@ -38,10 +38,14 @@ export interface Worktree {
 
 export interface RepositoryState {
   root: string;
+  /** Absolute git dir; in a linked worktree this is not `<root>/.git`. */
+  gitDir: string;
   currentBranch?: string | null;
   head: string;
   merging: boolean;
   rebasing: boolean;
+  cherryPicking: boolean;
+  reverting: boolean;
   files: FileStatus[];
   branches: Branch[];
   remotes: string[];
@@ -52,6 +56,18 @@ export interface RepositoryState {
   worktrees: Worktree[];
   stashes: StashEntry[];
   userName?: string | null;
+  userEmail?: string | null;
+}
+
+/** The fast-changing slice of RepositoryState, refreshed on its own. */
+export interface WorktreeStatus {
+  currentBranch?: string | null;
+  head: string;
+  merging: boolean;
+  rebasing: boolean;
+  cherryPicking: boolean;
+  reverting: boolean;
+  files: FileStatus[];
 }
 
 export interface CommitNode {
@@ -236,4 +252,189 @@ export interface RebasePlan {
   inProgress: boolean;
   currentBranch?: string | null;
   upstream?: string | null;
+}
+
+export interface ConflictCheck {
+  target: string;
+  supported: boolean;
+  upToDate: boolean;
+  conflicts: boolean;
+  files: string[];
+}
+
+export interface ReflogEntry {
+  hash: string;
+  shortHash: string;
+  selector: string;
+  action: string;
+  message: string;
+  relativeDate: string;
+}
+
+export interface FileHistoryEntry {
+  hash: string;
+  shortHash: string;
+  author: string;
+  email: string;
+  relativeDate: string;
+  subject: string;
+  /** The file's path in that commit (differs from today's after a rename). */
+  path: string;
+  status: string;
+}
+
+export interface BlameLine {
+  hash: string;
+  shortHash: string;
+  author: string;
+  summary: string;
+  time: number;
+  line: number;
+  text: string;
+}
+
+export interface Submodule {
+  path: string;
+  commit: string;
+  /** "current" | "uninitialized" | "modified" | "conflict" */
+  status: string;
+  describe?: string | null;
+}
+
+export interface RemoteInfo {
+  name: string;
+  fetchUrl: string;
+  pushUrl: string;
+}
+
+export interface RepoConfig {
+  remotes: RemoteInfo[];
+  submodules: Submodule[];
+  lfsAvailable: boolean;
+  lfsInitialized: boolean;
+  lfsPatterns: string[];
+  sparseEnabled: boolean;
+  sparseCone: boolean;
+  sparsePaths: string[];
+  userName?: string | null;
+  userEmail?: string | null;
+  identityScope?: string | null;
+  signingKey?: string | null;
+  gpgFormat?: string | null;
+  gpgProgram?: string | null;
+  commitGpgsign: boolean;
+  tagGpgsign: boolean;
+  mergeTool?: string | null;
+  diffTool?: string | null;
+}
+
+export interface Signature {
+  /** git's %G?: G good, B bad, U unknown validity, X/Y expired, R revoked, E can't check, N none. */
+  status: string;
+  signer: string;
+  key: string;
+}
+
+/** An author identity the user can apply to a repository. */
+export interface Profile {
+  id: string;
+  label: string;
+  name: string;
+  email: string;
+  signingKey?: string;
+  signingFormat?: "" | "openpgp" | "ssh" | "x509";
+  signCommits?: boolean;
+}
+
+export interface PaletteItem {
+  id: string;
+  title: string;
+  group: string;
+  subtitle?: string;
+  shortcut?: string;
+  run: () => unknown;
+}
+
+export interface MenuItem {
+  label?: string;
+  run?: () => unknown;
+  danger?: boolean;
+  disabled?: boolean;
+  separator?: boolean;
+  hint?: string;
+}
+
+export interface PullRequest {
+  number: number;
+  title: string;
+  url: string;
+  head: string;
+  base: string;
+  author: string;
+  draft: boolean;
+  state: string;
+  /** "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | "" */
+  review: string;
+  /** "success" | "failure" | "pending" | "" */
+  checks: string;
+  updatedAt: string;
+  repository: string;
+}
+
+export interface Issue {
+  number: number;
+  title: string;
+  url: string;
+  labels: string[];
+  assignees: string[];
+  updatedAt: string;
+}
+
+export interface AiStatus {
+  hasKey: boolean;
+  source?: "keychain" | "environment" | null;
+  model: string;
+}
+
+export interface CommitExplanation {
+  summary: string;
+  details: string[];
+  risks: string[];
+}
+
+export interface AiConflictResolution {
+  index: number;
+  resolution: string;
+  confidence: number;
+  explanation: string;
+}
+
+export interface ConflictProposal {
+  summary: string;
+  resolutions: AiConflictResolution[];
+}
+
+export interface RepoSummary {
+  path: string;
+  ok: boolean;
+  error?: string | null;
+  branch?: string | null;
+  upstream?: string | null;
+  ahead: number;
+  behind: number;
+  changes: number;
+  conflicts: number;
+}
+
+export interface WorkspaceResult {
+  path: string;
+  ok: boolean;
+  message: string;
+}
+
+/** A named group of repositories (kept in settings). */
+export interface Workspace {
+  id: string;
+  name: string;
+  paths: string[];
 }
